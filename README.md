@@ -1,6 +1,6 @@
-# CDSSDEMO
+# Brad DeLong's Weblog Archive
 
-Recovering and organizing Brad DeLong's weblog archive (pre-2005) — a Streamlit app built in UC Berkeley's CDSS Data Discovery practicum.
+Recovering and organizing Brad DeLong's weblog archive (pre-2005) — a Streamlit app built in UC Berkeley's CDSS Data Discovery practicum. (Repository slug: CDSSDEMO — only the display name changed, the repository address is unchanged.)
 
 **Live demo:** https://dsdiscovery-pre2005demo.streamlit.app/
 
@@ -39,6 +39,7 @@ On first run, the app downloads the corpus database (`weblog_corpus.db`, 100 MB+
 app.py                          # Streamlit app (search, timeline, asset recovery)
 requirements.txt                # Third-party dependencies (streamlit, pandas)
 .gitignore                      # Python, virtualenvs, and the downloaded database
+LICENSE                         # MIT License for the code in this repository
 scripts/
   classify_missing.py         # Build the missing_assets table and classify each missing path
                               # (chart / chrome / desktop / other)
@@ -59,6 +60,10 @@ python scripts/wayback_recover.py
 # Options: --limit N to cap the run, --sleep SECONDS between requests,
 # --retry-errors to also retry rows in an error state
 ```
+
+## License
+
+The code in this repository is licensed under the MIT License — see `LICENSE`. The DeLong weblog text, images, and corpus database are not covered by this license.
 
 ## Data provenance and limits
 
