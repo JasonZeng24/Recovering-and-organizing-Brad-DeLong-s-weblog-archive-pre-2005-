@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# Corpus database: downloaded at first run from the V2.0 Release, never committed
+weblog_corpus.db
+*.db
+*.db-journal
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
