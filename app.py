@@ -13,6 +13,7 @@ import streamlit.components.v1 as components
 
 # --- 1. 自动从 GitHub Release 缓存下载 DB 文件 ---
 DB_PATH = "weblog_corpus.db"
+# 注意：如果部署到 Streamlit Cloud，记得把新版 weblog_corpus.db 上传到 Release 并更新此处版本号
 RELEASE_URL = "https://github.com/JasonZeng24/CDSSDEMO/releases/download/V2.0/weblog_corpus.db"
 
 st.set_page_config(
@@ -40,6 +41,20 @@ def get_db_connection():
     return sqlite3.connect(DB_PATH)
 
 
+@st.cache_data(show_spinner=False)
+def get_posts_columns() -> set[str]:
+    """检测当前 weblog_corpus.db 是否包含合并后的新字段，确保新旧库 100% 兼容。"""
+    conn = get_db_connection()
+    try:
+        return {row[1] for row in conn.execute("PRAGMA table_info(posts)").fetchall()}
+    finally:
+        conn.close()
+
+
+POSTS_COLS = get_posts_columns()
+HAS_MERGED_SCHEMA = {"is_canonical_post", "is_unique_corpus", "wayback_url", "exact_post_datetime"}.issubset(POSTS_COLS)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_recovered_assets(post_id: int):
     """Return a list of (orig_path, wayback_url) with hit status for the given post."""
@@ -60,15 +75,11 @@ def get_recovered_assets(post_id: int):
         conn.close()
 
 
-
 # ---------------------------------------------------------------------------
-# Wayback 相关
-# 原站文章真实 URL 格式：
-#   http://www.j-bradford-delong.net/movable_type/2003_archives/001221.html
+# Wayback 相关（用于未命中 CDX 精确快照时的兜底推算）
 # ---------------------------------------------------------------------------
 SITE_HOSTS = ("www.j-bradford-delong.net", "j-bradford-delong.net")
 
-# 各年份首页快照（兜底用）
 VERIFIED_WAYBACK_SNAPSHOTS = {
     "2000": "https://web.archive.org/web/20000815052826/http://www.j-bradford-delong.net/",
     "2001": "https://web.archive.org/web/20010720233229/http://www.j-bradford-delong.net/",
@@ -87,19 +98,17 @@ def _clean_component(c: str) -> str:
 
 
 def get_wayback_info(rel_path: str, post_date: str, body_text: str):
-    """
-    返回 (年份首页快照, 年份, 时间戳, 候选原站URL列表, 年份日历页)
-    原站单篇文章 URL 格式：movable_type/{文件夹}/{文章ID}.html
-    """
+    """返回 (年份首页快照, 年份, 时间戳, 候选原站URL列表, 年份日历页)"""
     rel = str(rel_path or "").replace("\\", "/").strip()
     pdate = str(post_date or "").strip()
 
-    # 年份 + 精确日期（让 Wayback 找离发帖日最近的快照）
     dt = None
-    try:
-        dt = datetime.strptime(pdate, "%B %d, %Y")
-    except Exception:
-        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%B %d, %Y"):
+        try:
+            dt = datetime.strptime(pdate, fmt)
+            break
+        except Exception:
+            continue
 
     if dt:
         yr = str(dt.year)
@@ -109,31 +118,25 @@ def get_wayback_info(rel_path: str, post_date: str, body_text: str):
         yr = m_yr.group(1) if m_yr else "2003"
         ts = f"{yr}0701"
 
-    # 候选路径
     parts = [_clean_component(c) for c in rel.split("/") if c.strip()]
     paths = []
     if parts:
         fname, folders = parts[-1], parts[:-1]
         m = re.fullmatch(r"(\d{4,7})\.html?", fname, re.IGNORECASE)
         if m and folders and "archives" in folders[-1].lower():
-            # 单篇文章页：movable_type/{文件夹}/{ID}.html
             folder = folders[-1]
             names = [folder]
-            m2 = re.match(r"^(\d{4})-\d+_archives$", folder)  # 如 2005-3_archives
+            m2 = re.match(r"^(\d{4})-\d+_archives$", folder)
             if m2:
-                names.append(f"{m2.group(1)}_archives")  # 备选：去掉分卷号
+                names.append(f"{m2.group(1)}_archives")
             for n in names:
                 paths.append(f"movable_type/{quote(n)}/{m.group(1)}.html")
         else:
-            # 非文章页（分类页 cat_*.html、首页变体、OpEd 等）
             in_archives = any("archives" in f.lower() for f in folders)
-            if in_archives and folders[0].lower() != "movable_type":
-                # 本地目录丢掉了 movable_type/ 这一层，补回去
+            if in_archives and folders and folders[0].lower() != "movable_type":
                 prefixed = ["movable_type"] + parts
                 paths.append("/".join(quote(c) for c in prefixed))
-                # 备选：月度/周度/分类页有时直接放在 movable_type/ 根下
                 paths.append(f"movable_type/{quote(fname)}")
-                # 分卷目录（如 2005-3_archives）再给一个去掉分卷号的备选
                 m2 = re.match(r"^(\d{4})-\d+_archives$", folders[-1])
                 if m2:
                     alt = ["movable_type"] + parts[:-2] + [f"{m2.group(1)}_archives", fname]
@@ -211,7 +214,6 @@ READER_CSS = """
 
 
 def _highlight(escaped_text: str, query: str) -> str:
-    """在已转义的文本上高亮关键词，跳过 &amp; 之类的 HTML 实体。"""
     if len(query) < 2:
         return escaped_text
     q = re.escape(htmllib.escape(query))
@@ -242,13 +244,10 @@ def _paragraphs(text: str, query: str, sents_per_para: int = 3) -> str:
 
 
 def format_post_as_html(raw_text: str, search_query: str = "") -> str:
-    """把粘连的纯文本重构为完整的、自带样式的 HTML 页面。"""
     if not raw_text:
         return ""
 
     q = search_query.strip().replace('"', "")
-
-    # 1. 剥离顶部导航栏噪音
     text = re.sub(
         r"^.*?Website Policies\s*",
         "",
@@ -257,7 +256,6 @@ def format_post_as_html(raw_text: str, search_query: str = "") -> str:
         flags=re.IGNORECASE | re.DOTALL,
     )
 
-    # 2. 按日期切分：[前言, 日期1, 正文1, 日期2, 正文2, ...]
     parts = DATE_RE.split(text)
     html_parts = []
     if parts[0].strip():
@@ -268,7 +266,6 @@ def format_post_as_html(raw_text: str, search_query: str = "") -> str:
         body = parts[i + 1] if i + 1 < len(parts) else ""
         html_parts.append(f'<h3 class="date">📅 {htmllib.escape(date)}</h3>')
 
-        # 3. 按签名栏切开：[正文, 签名, 正文, 签名, ...]
         segs = FOOTER_RE.split(body)
         for j, seg in enumerate(segs):
             if j % 2 == 0:
@@ -283,10 +280,9 @@ def format_post_as_html(raw_text: str, search_query: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# 时间轴统计：去重 + 只统计单篇文章页
+# 时间轴统计
 # ---------------------------------------------------------------------------
 def _entry_key(rel_path):
-    """单篇文章页返回 '规范化文件夹/ID.html'，其他页面（月度/周度/分类/首页变体）返回 None。"""
     parts = [
         _clean_component(c)
         for c in str(rel_path or "").replace("\\", "/").split("/")
@@ -302,7 +298,6 @@ def _entry_key(rel_path):
 
 
 def _norm_title(t):
-    """去掉不同时期模板加的前后缀，便于跨备份副本去重。"""
     t = str(t or "").strip()
     t = re.sub(
         r":?\s*Archive Entry From Brad DeLong[’']s (?:Webjournal|Semi-Daily Journal)\s*$",
@@ -317,15 +312,29 @@ def _norm_title(t):
 @st.cache_data(show_spinner=False)
 def load_timeline_df():
     conn = get_db_connection()
-    df = pd.read_sql_query(
-        "SELECT rel_path, title, post_date FROM posts "
-        "WHERE post_date IS NOT NULL AND post_date != 'Unknown';",
-        conn,
-    )
+    if HAS_MERGED_SCHEMA:
+        df = pd.read_sql_query(
+            "SELECT rel_path, title, post_date, exact_post_datetime, is_canonical_post, is_unique_corpus "
+            "FROM posts WHERE (exact_post_datetime IS NOT NULL) OR (post_date IS NOT NULL AND post_date != 'Unknown');",
+            conn,
+        )
+    else:
+        df = pd.read_sql_query(
+            "SELECT rel_path, title, post_date FROM posts "
+            "WHERE post_date IS NOT NULL AND post_date != 'Unknown';",
+            conn,
+        )
     conn.close()
 
-    cleaned = df["post_date"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
-    df["date"] = pd.to_datetime(cleaned, format="%B %d, %Y", errors="coerce")
+    cleaned_legacy = df["post_date"].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+    legacy_dt = pd.to_datetime(cleaned_legacy, format="%B %d, %Y", errors="coerce")
+
+    if HAS_MERGED_SCHEMA:
+        exact_dt = pd.to_datetime(df["exact_post_datetime"], errors="coerce")
+        df["date"] = exact_dt.fillna(legacy_dt)
+    else:
+        df["date"] = legacy_dt
+
     df = df.dropna(subset=["date"])
     df = df[(df["date"].dt.year >= 1990) & (df["date"].dt.year <= 2029)].copy()
 
@@ -353,28 +362,39 @@ A digital catalog with a mouth for 20+ years of economic history, policy critiqu
 )
 st.sidebar.divider()
 
-# 数据统计卡片
 try:
     conn = get_db_connection()
-    total_posts = pd.read_sql_query(
-        "SELECT COUNT(*) AS c FROM posts;", conn
-    ).iloc[0]["c"]
+    total_posts = pd.read_sql_query("SELECT COUNT(*) AS c FROM posts;", conn).iloc[0]["c"]
     dated_posts = pd.read_sql_query(
         "SELECT COUNT(*) AS c FROM posts WHERE post_date != 'Unknown';", conn
     ).iloc[0]["c"]
     missing_asset_posts = pd.read_sql_query(
         "SELECT COUNT(*) AS c FROM posts WHERE missing_imgs > 0;", conn
     ).iloc[0]["c"]
+
+    if HAS_MERGED_SCHEMA:
+        unique_docs = pd.read_sql_query(
+            "SELECT COUNT(*) AS c FROM posts WHERE is_unique_corpus = 1;", conn
+        ).iloc[0]["c"]
+        canonical_posts = pd.read_sql_query(
+            "SELECT COUNT(*) AS c FROM posts WHERE is_canonical_post = 1;", conn
+        ).iloc[0]["c"]
+        verified_wb = pd.read_sql_query(
+            "SELECT COUNT(*) AS c FROM posts WHERE wayback_url IS NOT NULL;", conn
+        ).iloc[0]["c"]
     conn.close()
 
-    st.sidebar.metric("Indexed DeLong Posts", f"{total_posts:,}")
-    st.sidebar.metric(
-        "Temporal Recovery Rate", f"{(dated_posts / total_posts):.1%}"
-    )
-    st.sidebar.metric(
-        "Asset Integrity Rate",
-        f"{((total_posts - missing_asset_posts) / total_posts):.1%}",
-    )
+    st.sidebar.metric("Total Indexed HTML Files", f"{total_posts:,}")
+    if HAS_MERGED_SCHEMA:
+        st.sidebar.metric("Unique Deduplicated Docs", f"{unique_docs:,}")
+        st.sidebar.metric("Canonical Blog Posts (2001–05)", f"{canonical_posts:,}")
+        st.sidebar.metric("Verified Wayback Links", f"{verified_wb:,}")
+    else:
+        st.sidebar.metric("Temporal Recovery Rate", f"{(dated_posts / total_posts):.1%}")
+        st.sidebar.metric(
+            "Asset Integrity Rate",
+            f"{((total_posts - missing_asset_posts) / total_posts):.1%}",
+        )
 except Exception as e:
     st.sidebar.warning(f"Database error: {e}")
 
@@ -392,26 +412,57 @@ nav_mode = st.sidebar.radio(
 if nav_mode == "DeLong Full-Text Search (FTS5)":
     st.title("Search Brad DeLong's Weblog Archive")
     st.markdown(
-        "**Explore 21,500+ original posts and economic commentary from Brad"
-        " DeLong's *Semi-Daily Journal* (Pre-2005).**  \n*Powered by SQLite FTS5"
-        " & HTML Content Renderer.*"
+        "**Explore deduplicated posts, early essays, and course notes from Brad"
+        " DeLong's *Semi-Daily Journal* (Pre-2005).**  \n*Powered by SQLite FTS5,"
+        " CDX Wayback Provenance & HTML Content Renderer.*"
     )
 
-    col1, col2 = st.columns([3, 1])
+    if HAS_MERGED_SCHEMA:
+        col1, col2, col3 = st.columns([2.5, 1.5, 1])
+    else:
+        col1, col3 = st.columns([3, 1])
+
     with col1:
         query_text = st.text_input(
             "Search keywords or phrases in DeLong's writings:",
             value="Zhu Rongji",
             placeholder="e.g. Zhu Rongji, Greenspan, East Asian Crisis, Krugman",
         )
-    with col2:
+
+    scope_filter_sql = ""
+    if HAS_MERGED_SCHEMA:
+        with col2:
+            corpus_scope = st.selectbox(
+                "Corpus Scope:",
+                [
+                    "Unique Archive (11,772 docs)",
+                    "Canonical Blog Posts (2001–2005, 6,533)",
+                    "Early Pages & Courses Only (5,239)",
+                    "All Raw Files (Unfiltered, 21,531)",
+                ],
+                index=0,
+            )
+            if corpus_scope.startswith("Unique Archive"):
+                scope_filter_sql = "AND p.is_unique_corpus = 1"
+            elif corpus_scope.startswith("Canonical Blog"):
+                scope_filter_sql = "AND p.is_canonical_post = 1"
+            elif corpus_scope.startswith("Early Pages"):
+                scope_filter_sql = "AND p.is_unique_corpus = 1 AND p.is_canonical_post = 0"
+
+    with col3:
         max_results = st.selectbox(
-            "Max results to display:", [5, 10, 20, 50], index=1
+            "Max results:", [5, 10, 20, 50], index=1
         )
 
     if query_text.strip():
         conn = get_db_connection()
-        search_sql = """
+        extra_select = (
+            "p.exact_post_datetime, p.wayback_url, p.is_canonical_post, p.permalink,"
+            if HAS_MERGED_SCHEMA
+            else "NULL AS exact_post_datetime, NULL AS wayback_url, 0 AS is_canonical_post, p.permalink,"
+        )
+
+        search_sql = f"""
         SELECT 
             p.id, 
             p.title, 
@@ -419,10 +470,12 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
             p.rel_path, 
             p.body_clean,
             p.missing_imgs,
+            {extra_select}
             snippet(posts_fts, 1, '<mark style="background-color: #fef08a; font-weight: bold; color: #1e293b;">', '</mark>', '...', 35) AS snippet_text
         FROM posts_fts
         JOIN posts p ON posts_fts.rowid = p.id
         WHERE posts_fts MATCH ?
+        {scope_filter_sql}
         LIMIT ?;
         """
         try:
@@ -440,6 +493,11 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                 post_title = (
                     row["title"] if row["title"] else "Untitled Entry / DeLong Note"
                 )
+                display_date = (
+                    row["exact_post_datetime"]
+                    if pd.notna(row["exact_post_datetime"]) and str(row["exact_post_datetime"]).strip()
+                    else row["post_date"]
+                )
                 status_color = "green" if row["missing_imgs"] == 0 else "orange"
                 status_label = (
                     "Complete Local Assets"
@@ -451,17 +509,21 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                 is_local_valid = len(raw_body) > 40
 
                 wb_home, yr_tag, wb_ts, post_urls, wb_calendar = get_wayback_info(
-                    row["rel_path"], row["post_date"], raw_body
+                    row["rel_path"], display_date, raw_body
                 )
 
                 with st.expander(
-                    f"📝 {post_title} ({row['post_date']})", expanded=True
+                    f"📝 {post_title} ({display_date})", expanded=True
                 ):
-                    # 顶部元数据与来源徽章
                     top_c1, top_c2 = st.columns([3, 1])
                     with top_c1:
+                        canonical_tag = (
+                            " | :blue[**🏛️ Canonical Blog Post**]"
+                            if row["is_canonical_post"] == 1
+                            else ""
+                        )
                         st.caption(
-                            f"Record ID: `{row['id']}` | Local File: `{row['rel_path']}` | Integrity: :{status_color}[{status_label}]"
+                            f"Record ID: `{row['id']}` | Local File: `{row['rel_path']}` | Integrity: :{status_color}[{status_label}]{canonical_tag}"
                         )
                     with top_c2:
                         if is_local_valid:
@@ -469,13 +531,11 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                         else:
                             st.markdown(":blue-background[🌐 Sourced from Wayback]")
 
-                    # 匹配高亮摘要
                     st.markdown(
                         f"**Matched Contextual Excerpt:**\n> {row['snippet_text']}",
                         unsafe_allow_html=True,
                     )
 
-                    # HTML 全文阅读器（toggle 代替嵌套 expander）
                     if st.toggle("📖 Read Full Article", key=f"read_{row['id']}"):
                         if is_local_valid:
                             doc = format_post_as_html(raw_body, query_text)
@@ -485,7 +545,6 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                                 "Local file content is missing or corrupt. Please use the Wayback link below."
                             )
 
-                    # Recovered images gallery (from missing_assets lookup)
                     recovered = get_recovered_assets(int(row["id"]))
                     if recovered:
                         st.markdown(
@@ -494,37 +553,60 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                         img_cols = st.columns(min(len(recovered), 3))
                         for idx, (orig_path, wb_url) in enumerate(recovered[:6]):
                             with img_cols[idx % len(img_cols)]:
-                                # Use Wayback's "if_" raw mode so the image loads without the toolbar frame
                                 raw_wb = re.sub(
                                     r"/web/(\d+)/", r"/web/\1if_/", wb_url, count=1
                                 )
                                 try:
-                                    st.image(raw_wb, caption=orig_path.split("/")[-1], use_container_width=True)
+                                    st.image(
+                                        raw_wb,
+                                        caption=orig_path.split("/")[-1],
+                                        use_container_width=True,
+                                    )
                                 except Exception:
                                     st.markdown(f"[{orig_path.split('/')[-1]}]({wb_url})")
                         if len(recovered) > 6:
                             st.caption(f"...and {len(recovered) - 6} more recovered figures")
 
-                    # Wayback 链接
+                    # Wayback 链接（优先展示 CDX 精确匹配链接）
                     st.divider()
                     links = []
-                    if post_urls:
-                        # 直达链接：Wayback 会自动跳到离该日期最近的快照
+                    verified_wb_url = (
+                        str(row["wayback_url"]).strip()
+                        if pd.notna(row["wayback_url"]) and str(row["wayback_url"]).strip()
+                        else None
+                    )
+                    if verified_wb_url:
+                        links.append(
+                            f"**[✅ Verified Wayback Snapshot (CDX)]({verified_wb_url})**"
+                        )
+                    elif post_urls:
                         direct = f"https://web.archive.org/web/{wb_ts}/{post_urls[0]}"
-                        links.append(f"**[🌐 Open this post on Wayback]({direct})**")
+                        links.append(f"**[🌐 Open derived post on Wayback]({direct})**")
+
+                    if pd.notna(row["permalink"]) and str(row["permalink"]).strip():
+                        links.append(
+                            f"[All captures of canonical URL](https://web.archive.org/web/*/{row['permalink']})"
+                        )
+                    elif post_urls:
+                        links.append(
+                            f"[All captures of this URL](https://web.archive.org/web/*/{post_urls[0]})"
+                        )
+
                     links.append(f"[{yr_tag} homepage snapshot]({wb_home})")
                     links.append(f"[Browse all {yr_tag} captures]({wb_calendar})")
-                    if post_urls:
-                        links.append(
-                            f"[All captures of this exact URL](https://web.archive.org/web/*/{post_urls[0]})"
-                        )
                     st.markdown(" · ".join(links))
 
-                    # 可选：用官方接口确认该文章是否真的有存档，并显示调试信息
                     if st.toggle(
                         "🔎 Check availability & debug", key=f"wb_{row['id']}"
                     ):
-                        if post_urls:
+                        if verified_wb_url:
+                            st.success("Pre-verified via Wayback Machine CDX API.")
+                            st.code(
+                                f"wayback_url = {verified_wb_url}\n"
+                                f"permalink   = {row['permalink']!r}\n"
+                                f"rel_path    = {row['rel_path']!r}"
+                            )
+                        elif post_urls:
                             hit, debug = find_closest_snapshot(tuple(post_urls), wb_ts)
                             if hit:
                                 st.success("Snapshot found.")
@@ -536,13 +618,11 @@ if nav_mode == "DeLong Full-Text Search (FTS5)":
                                 )
                             st.code(
                                 f"rel_path = {row['rel_path']!r}\n"
-                                f"post_date = {row['post_date']!r}\n"
+                                f"post_date = {display_date!r}\n"
                                 + "\n".join(debug or ["(all lookups returned a hit)"])
                             )
                         else:
-                            st.warning(
-                                "Could not derive a post URL from rel_path."
-                            )
+                            st.warning("Could not derive a post URL from rel_path.")
                             st.code(f"rel_path = {row['rel_path']!r}")
 
         except Exception as err:
@@ -566,27 +646,39 @@ elif nav_mode == "Posting Timeline & Trends":
         st.info("No timeline data available.")
     else:
         c1, c2 = st.columns(2)
+        mode_options = (
+            [
+                "Canonical blog posts (2001–2005, 6,533)",
+                "All unique archive docs (deduplicated)",
+                "All dated records (raw)",
+            ]
+            if HAS_MERGED_SCHEMA
+            else ["Unique posts (deduplicated)", "All dated records"]
+        )
         with c1:
-            count_mode = st.radio(
-                "Count",
-                ["Unique posts (deduplicated)", "All dated records"],
-                horizontal=True,
-            )
+            count_mode = st.radio("Count", mode_options, horizontal=False)
         with c2:
             gran = st.radio("Granularity", ["By year", "By month"], horizontal=True)
 
-        if count_mode.startswith("Unique"):
+        if count_mode.startswith("Canonical blog"):
+            d = tl[tl["is_canonical_post"] == 1]
+            st.caption(
+                "Exact 6,533 individual Movable Type blog posts verified across the 2001–2005 archives."
+            )
+        elif count_mode.startswith("All unique"):
+            d = tl[tl["is_unique_corpus"] == 1]
+            st.caption(
+                "All 11,772 deduplicated documents (canonical blog posts + early essays & course pages)."
+            )
+        elif count_mode.startswith("Unique"):
             d = tl[tl["is_entry"]].drop_duplicates("dedupe_key")
             st.caption(
-                "Only single-entry pages are counted, and copies of the same post "
-                "across backup folders are merged. Monthly, weekly, category and "
-                "index pages are excluded."
+                "Only single-entry pages are counted, and copies across backup folders are merged."
             )
         else:
             d = tl
             st.caption(
-                "Every record with a valid date, including aggregator pages and "
-                "duplicate backup copies, so totals will be inflated."
+                "Every record with a valid date, including aggregator pages and duplicate backup copies."
             )
 
         if d.empty:
@@ -612,7 +704,7 @@ elif nav_mode == "Posting Timeline & Trends":
             st.bar_chart(chart_df, color="#003262")
             st.dataframe(chart_df.reset_index(), use_container_width=True)
 
-# --- 5. 页面 3：Asset Recovery (missing-asset classification + Wayback recovery) ---
+# --- 5. 页面 3：Asset Recovery ---
 elif nav_mode == "Resource Health Audit":
     st.title("Asset Recovery & Health Audit")
     st.markdown(
@@ -623,9 +715,12 @@ elif nav_mode == "Resource Health Audit":
     )
 
     conn = get_db_connection()
-    has_recovery = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='missing_assets'"
-    ).fetchone() is not None
+    has_recovery = (
+        conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='missing_assets'"
+        ).fetchone()
+        is not None
+    )
 
     if not has_recovery:
         st.warning(
@@ -659,7 +754,7 @@ elif nav_mode == "Resource Health Audit":
         n_hit = int(status_counts.loc[status_counts["status"] == "hit", "n"].sum())
         n_miss = int(status_counts.loc[status_counts["status"] == "miss", "n"].sum())
         n_pending = int(status_counts.loc[status_counts["status"] == "pending", "n"].sum())
-        recoverable = n_chart + n_other  # not chrome/desktop
+        recoverable = n_chart + n_other
         recovery_rate = (n_hit / recoverable) if recoverable else 0.0
 
         st.subheader("Triage of missing-asset references")
