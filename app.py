@@ -14,7 +14,7 @@ import streamlit.components.v1 as components
 # --- 1. 自动从 GitHub Release 缓存下载 DB 文件 ---
 DB_PATH = "weblog_corpus.db"
 # 注意：如果部署到 Streamlit Cloud，记得把新版 weblog_corpus.db 上传到 Release 并更新此处版本号
-RELEASE_URL = "https://github.com/JasonZeng24/CDSSDEMO/releases/download/V2.0/weblog_corpus.db"
+RELEASE_URL = "https://github.com/JasonZeng24/Recovering-and-organizing-Brad-DeLong-s-weblog-archive-pre-2005-/releases/download/V2.1/weblog_corpus.db"
 
 st.set_page_config(
     page_title="Brad DeLong's Weblog Archive (1995–2005)",
